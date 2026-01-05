@@ -4,173 +4,198 @@ import numpy_financial as npf
 
 app = FastAPI()
 
-# ---- API KEY (hard-coded for now) ----
 API_KEY = "meadows_internal_key_123"
+
+
+def parse_array(value, name):
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return [float(x) for x in value]
+    if isinstance(value, str):
+        parts = [p for p in value.split(",") if p.strip() != ""]
+        try:
+            return [float(p) for p in parts]
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"{name} contains non-numeric values")
+    raise HTTPException(status_code=400, detail=f"{name} must be a list or comma-separated string")
 
 
 @app.post("/run-analysis")
 def run_analysis(payload: dict, x_api_key: str = Header(None)):
-    # ---- API key check ----
+
+    # -------------------- AUTH --------------------
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
-    # ---- Extract inputs ----
-    cashflow_block = payload.get("cashflow", {})
-    raw_cashflows = cashflow_block.get("cashflows")  # expect string from Bubble
+    # -------------------- INPUTS --------------------
+    cashflows = parse_array(payload.get("cashflow", {}).get("cashflows"), "cashflows")
+    ebitda = parse_array(payload.get("ebitda", {}).get("ebitda"), "ebitda")
+    dev_costs = parse_array(payload.get("development_costs", {}).get("costs"), "development_costs")
 
     debt = payload.get("debt_terms", {})
 
-    loan_amount = float(debt.get("loan_amount", 0))
-    interest_rate = float(debt.get("interest_rate", 0))
-    tenor_months = int(debt.get("tenor_months", 0))
-    repayment_type = str(debt.get("repayment_type", "")).lower()
+    loan = float(debt.get("loan_amount", 0))
+    rate = float(debt.get("interest_rate", 0))
+    tenor = int(debt.get("tenor_months", 0))
+    io_period = int(debt.get("interest_only_period", 0))
+    repayment = str(debt.get("repayment", "")).lower()
+    amort_rate = float(debt.get("amortisation_rate", 0))
+    availability = int(debt.get("availability_period", 0))
+    drawdown_mode = str(debt.get("drawdown_mode", "upfront")).lower()
+    roll_up = bool(debt.get("interest_roll_up", False))
 
-    # Optional / extended inputs (safe defaults)
     arrangement_fee = float(debt.get("arrangement_fee", 0))
     exit_fee = float(debt.get("exit_fee", 0))
-    interest_only_period = int(debt.get("interest_only_period", 0))
-    amortisation_rate = debt.get("amortisation_rate")  # may be None
-    dscr_threshold = debt.get("dscr_threshold")  # may be None
 
-    # ---- Parse cashflows string into list[float] ----
-    cashflows = None
+    dscr_threshold = debt.get("dscr_threshold")
+    icr_threshold = debt.get("icr_threshold")
+    debt_ebitda_max = debt.get("debt_to_ebitda_max")
+    ltv_threshold = debt.get("ltv_threshold")
+    ltc_threshold = debt.get("ltc_threshold")
 
-    if isinstance(raw_cashflows, str):
-        parts = [p for p in raw_cashflows.split(",") if p.strip() != ""]
-        try:
-            cashflows = [float(p) for p in parts]
-        except ValueError:
-            raise HTTPException(
-                status_code=400,
-                detail="cashflows string contains non-numeric values",
-            )
-    elif isinstance(raw_cashflows, list):
-        try:
-            cashflows = [float(x) for x in raw_cashflows]
-        except (TypeError, ValueError):
-            raise HTTPException(
-                status_code=400,
-                detail="cashflows list contains non-numeric values",
-            )
-    else:
-        raise HTTPException(
-            status_code=400,
-            detail="cashflows must be a comma-separated string or a list",
-        )
+    property_value = debt.get("property_value")
 
-    # ---- Validation ----
-    if not cashflows:
-        raise HTTPException(status_code=400, detail="cashflows missing or empty")
+    # -------------------- VALIDATION --------------------
+    if not cashflows or len(cashflows) < tenor:
+        raise HTTPException(status_code=400, detail="Insufficient cashflows")
 
-    if tenor_months <= 0:
-        raise HTTPException(status_code=400, detail="tenor_months must be > 0")
+    if ebitda and len(ebitda) < tenor:
+        raise HTTPException(status_code=400, detail="Insufficient EBITDA values")
 
-    if len(cashflows) < tenor_months:
-        raise HTTPException(
-            status_code=400,
-            detail="cashflows length must be >= tenor_months",
-        )
+    if dev_costs and len(dev_costs) < tenor:
+        raise HTTPException(status_code=400, detail="Insufficient development cost values")
 
-    # ---- Build internal monthly schedule (arrays stay INTERNAL) ----
-    balance = loan_amount
-    monthly_rate = interest_rate / 12.0
+    # -------------------- SCHEDULE ARRAYS --------------------
+    balance = 0.0
+    undrawn = loan
 
     balances = []
-    interest_payments = []
-    principal_payments = []
-    dscrs = []
+    interest = []
+    principal = []
+    drawdowns = []
 
-    for month in range(1, tenor_months + 1):
+    dscrs = []
+    icrs = []
+    debt_ebitdas = []
+    ltcs = []
+    ltvs = []
+
+    monthly_rate = rate / 12
+
+    # -------------------- MAIN LOOP --------------------
+    for t in range(1, tenor + 1):
+
+        # ---- DRAWDOWN ----
+        draw = 0.0
+        if drawdown_mode == "upfront" and t == 1:
+            draw = loan
+        elif drawdown_mode == "liquidity" and t <= availability:
+            if cashflows[t - 1] < 0 and undrawn > 0:
+                draw = min(abs(cashflows[t - 1]), undrawn)
+
+        undrawn -= draw
+        balance += draw
+        drawdowns.append(draw)
+
         balances.append(balance)
 
-        interest = balance * monthly_rate
-        interest_payments.append(interest)
+        # ---- INTEREST ----
+        int_t = balance * monthly_rate
+        interest.append(int_t)
 
-        cfads = cashflows[month - 1]
-        dscrs.append(cfads / interest if interest > 0 else None)
+        # ---- PRINCIPAL ----
+        princ = 0.0
+        if t > io_period:
+            if repayment == "bullet":
+                princ = 0.0
+            elif repayment == "amortising_straight_line":
+                princ = loan / (tenor - io_period)
+            elif repayment == "amortising_reducing_balance":
+                princ = balance * amort_rate / 12
 
-        # Principal logic
-        if month <= interest_only_period:
-            principal = 0.0
-        elif repayment_type == "bullet":
-            principal = 0.0
-        elif amortisation_rate:
-            principal = balance * float(amortisation_rate)
-        else:
-            principal = loan_amount / tenor_months
+        if t == tenor:
+            princ = balance  # clean up
 
-        principal_payments.append(principal)
-        balance -= principal
+        principal.append(princ)
 
-    # ---- Existing metrics ----
-    min_dscr = min(d for d in dscrs if d is not None)
-    average_interest = sum(interest_payments) / len(interest_payments)
+        # ---- BALANCE UPDATE ----
+        balance = balance - princ
+        if roll_up:
+            balance += int_t
 
-    # ---- NEW METRICS ----
+        # ---- RATIOS ----
+        debt_service = int_t + princ
+        dscrs.append(cashflows[t - 1] / debt_service if debt_service > 0 else None)
 
-    # Weighted Average Life (months)
-    principal_array = np.array(principal_payments)
-    time_array = np.arange(1, len(principal_array) + 1)
+        if ebitda:
+            icrs.append(ebitda[t - 1] / int_t if int_t > 0 else None)
+            debt_ebitdas.append(balance / ebitda[t - 1] if ebitda[t - 1] > 0 else None)
 
-    if principal_array.sum() > 0:
-        weighted_average_life_months = (
-            (principal_array * time_array).sum() / principal_array.sum()
-        )
-    else:
-        weighted_average_life_months = tenor_months
+        if dev_costs:
+            cum_cost = sum(dev_costs[:t])
+            ltcs.append(balance / cum_cost if cum_cost > 0 else None)
 
-    # Lender IRR
-    lender_cashflows = [-loan_amount - arrangement_fee]
+        if property_value:
+            ltvs.append(balance / float(property_value))
 
-    for i in range(len(interest_payments)):
-        lender_cashflows.append(
-            interest_payments[i] + principal_payments[i]
-        )
+    # -------------------- METRICS --------------------
+    min_dscr = min(x for x in dscrs if x is not None)
 
-    lender_cashflows[-1] += exit_fee
+    min_icr = min(x for x in icrs if x is not None) if icrs else None
+    max_debt_ebitda = max(x for x in debt_ebitdas if x is not None) if debt_ebitdas else None
+    max_ltc = max(x for x in ltcs if x is not None) if ltcs else None
+    max_ltv = max(x for x in ltvs if x is not None) if ltvs else None
 
-    try:
-        lender_irr = npf.irr(lender_cashflows)
-    except Exception:
-        lender_irr = None
-
-    # Weighted Average Cost of Debt (annualised)
-    total_interest = sum(interest_payments)
-    total_fees = arrangement_fee + exit_fee
-
-    weighted_avg_cost_of_debt = (
-        (total_interest + total_fees)
-        / (loan_amount * (tenor_months / 12))
+    wal = (
+        sum(p * (i + 1) for i, p in enumerate(principal)) / sum(principal)
+        if sum(principal) > 0 else tenor
     )
 
-    # Cash-on-cash yield (annualised)
+    lender_cfs = []
+    for i in range(tenor):
+        cf = -drawdowns[i]
+        if not roll_up:
+            cf += interest[i]
+        cf += principal[i]
+        lender_cfs.append(cf)
+
+    lender_cfs[0] -= arrangement_fee
+    lender_cfs[-1] += exit_fee
+
+    lender_irr = npf.irr(lender_cfs)
+
+    total_interest = sum(interest)
     avg_balance = np.mean(balances)
-    cash_on_cash_yield = (
-        (sum(interest_payments) / tenor_months * 12) / avg_balance
-        if avg_balance > 0
-        else None
-    )
 
-    # DSCR headroom
-    if dscr_threshold is not None:
-        dscr_headroom = min_dscr - float(dscr_threshold)
-        dscr_pass = min_dscr >= float(dscr_threshold)
-    else:
-        dscr_headroom = None
-        dscr_pass = None
+    wacd = (total_interest + arrangement_fee + exit_fee) / (avg_balance * (tenor / 12))
+    avg_interest = total_interest / tenor
 
-    # ---- Flat, Bubble-safe response ----
+    # -------------------- OUTPUT --------------------
     return {
         "min_dscr": min_dscr,
-        "ending_balance": balance,
-        "average_interest": average_interest,
+        "dscr_headroom": min_dscr - float(dscr_threshold) if dscr_threshold else None,
+        "dscr_pass": min_dscr >= float(dscr_threshold) if dscr_threshold else None,
 
-        "weighted_avg_cost_of_debt": weighted_avg_cost_of_debt,
-        "weighted_average_life_months": weighted_average_life_months,
+        "min_icr": min_icr,
+        "icr_headroom": min_icr - float(icr_threshold) if icr_threshold and min_icr else None,
+        "icr_pass": min_icr >= float(icr_threshold) if icr_threshold and min_icr else None,
+
+        "max_debt_to_ebitda": max_debt_ebitda,
+        "debt_to_ebitda_headroom": float(debt_ebitda_max) - max_debt_ebitda if debt_ebitda_max and max_debt_ebitda else None,
+        "debt_to_ebitda_pass": max_debt_ebitda <= float(debt_ebitda_max) if debt_ebitda_max and max_debt_ebitda else None,
+
+        "max_ltc": max_ltc,
+        "ltc_headroom": float(ltc_threshold) - max_ltc if ltc_threshold and max_ltc else None,
+        "ltc_pass": max_ltc <= float(ltc_threshold) if ltc_threshold and max_ltc else None,
+
+        "max_ltv": max_ltv,
+        "ltv_headroom": float(ltv_threshold) - max_ltv if ltv_threshold and max_ltv else None,
+        "ltv_pass": max_ltv <= float(ltv_threshold) if ltv_threshold and max_ltv else None,
+
+        "weighted_average_life_months": wal,
         "lender_irr": lender_irr,
-        "cash_on_cash_yield": cash_on_cash_yield,
-
-        "dscr_headroom": dscr_headroom,
-        "dscr_pass": dscr_pass,
+        "weighted_avg_cost_of_debt": wacd,
+        "average_interest": avg_interest,
+        "ending_balance": balance,
     }
-
