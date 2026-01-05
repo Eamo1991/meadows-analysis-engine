@@ -139,13 +139,21 @@ def run_analysis(payload: dict, x_api_key: str = Header(None)):
         if property_value:
             ltvs.append(balance / float(property_value))
 
-    # -------------------- METRICS --------------------
-    min_dscr = min(x for x in dscrs if x is not None)
+    # -------------------- METRICS (SAFE) --------------------
+    valid_dscrs = [x for x in dscrs if x is not None]
+    min_dscr = min(valid_dscrs) if valid_dscrs else None
 
-    min_icr = min(x for x in icrs if x is not None) if icrs else None
-    max_debt_ebitda = max(x for x in debt_ebitdas if x is not None) if debt_ebitdas else None
-    max_ltc = max(x for x in ltcs if x is not None) if ltcs else None
-    max_ltv = max(x for x in ltvs if x is not None) if ltvs else None
+    valid_icrs = [x for x in icrs if x is not None]
+    min_icr = min(valid_icrs) if valid_icrs else None
+
+    valid_debt_ebitdas = [x for x in debt_ebitdas if x is not None]
+    max_debt_ebitda = max(valid_debt_ebitdas) if valid_debt_ebitdas else None
+
+    valid_ltcs = [x for x in ltcs if x is not None]
+    max_ltc = max(valid_ltcs) if valid_ltcs else None
+
+    valid_ltvs = [x for x in ltvs if x is not None]
+    max_ltv = max(valid_ltvs) if valid_ltvs else None
 
     wal = (
         sum(p * (i + 1) for i, p in enumerate(principal)) / sum(principal)
@@ -174,24 +182,24 @@ def run_analysis(payload: dict, x_api_key: str = Header(None)):
     # -------------------- OUTPUT --------------------
     return {
         "min_dscr": min_dscr,
-        "dscr_headroom": min_dscr - float(dscr_threshold) if dscr_threshold else None,
-        "dscr_pass": min_dscr >= float(dscr_threshold) if dscr_threshold else None,
+        "dscr_headroom": min_dscr - float(dscr_threshold) if dscr_threshold and min_dscr is not None else None,
+        "dscr_pass": min_dscr >= float(dscr_threshold) if dscr_threshold and min_dscr is not None else None,
 
         "min_icr": min_icr,
-        "icr_headroom": min_icr - float(icr_threshold) if icr_threshold and min_icr else None,
-        "icr_pass": min_icr >= float(icr_threshold) if icr_threshold and min_icr else None,
+        "icr_headroom": min_icr - float(icr_threshold) if icr_threshold and min_icr is not None else None,
+        "icr_pass": min_icr >= float(icr_threshold) if icr_threshold and min_icr is not None else None,
 
         "max_debt_to_ebitda": max_debt_ebitda,
-        "debt_to_ebitda_headroom": float(debt_ebitda_max) - max_debt_ebitda if debt_ebitda_max and max_debt_ebitda else None,
-        "debt_to_ebitda_pass": max_debt_ebitda <= float(debt_ebitda_max) if debt_ebitda_max and max_debt_ebitda else None,
+        "debt_to_ebitda_headroom": float(debt_ebitda_max) - max_debt_ebitda if debt_ebitda_max and max_debt_ebitda is not None else None,
+        "debt_to_ebitda_pass": max_debt_ebitda <= float(debt_ebitda_max) if debt_ebitda_max and max_debt_ebitda is not None else None,
 
         "max_ltc": max_ltc,
-        "ltc_headroom": float(ltc_threshold) - max_ltc if ltc_threshold and max_ltc else None,
-        "ltc_pass": max_ltc <= float(ltc_threshold) if ltc_threshold and max_ltc else None,
+        "ltc_headroom": float(ltc_threshold) - max_ltc if ltc_threshold and max_ltc is not None else None,
+        "ltc_pass": max_ltc <= float(ltc_threshold) if ltc_threshold and max_ltc is not None else None,
 
         "max_ltv": max_ltv,
-        "ltv_headroom": float(ltv_threshold) - max_ltv if ltv_threshold and max_ltv else None,
-        "ltv_pass": max_ltv <= float(ltv_threshold) if ltv_threshold and max_ltv else None,
+        "ltv_headroom": float(ltv_threshold) - max_ltv if ltv_threshold and max_ltv is not None else None,
+        "ltv_pass": max_ltv <= float(ltv_threshold) if ltv_threshold and max_ltv is not None else None,
 
         "weighted_average_life_months": wal,
         "lender_irr": lender_irr,
