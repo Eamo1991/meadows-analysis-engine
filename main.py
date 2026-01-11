@@ -4,9 +4,12 @@ import numpy_financial as npf
 
 app = FastAPI()
 
+# -------------------- CONFIG --------------------
 API_KEY = "meadows_internal_key_123"
+DEBUG = True  # ← SET TO False AFTER DEBUGGING
 
 
+# -------------------- HELPERS --------------------
 def parse_array(value, name):
     if value is None:
         return None
@@ -17,10 +20,17 @@ def parse_array(value, name):
         try:
             return [float(p) for p in parts]
         except ValueError:
-            raise HTTPException(status_code=400, detail=f"{name} contains non-numeric values")
-    raise HTTPException(status_code=400, detail=f"{name} must be a list or comma-separated string")
+            raise HTTPException(
+                status_code=400,
+                detail=f"{name} contains non-numeric values",
+            )
+    raise HTTPException(
+        status_code=400,
+        detail=f"{name} must be a list or comma-separated string",
+    )
 
 
+# -------------------- ENDPOINT --------------------
 @app.post("/run-analysis")
 def run_analysis(payload: dict, x_api_key: str = Header(None)):
 
@@ -28,25 +38,28 @@ def run_analysis(payload: dict, x_api_key: str = Header(None)):
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
-    # -------------------- INPUTS --------------------
+    # -------------------- INPUT PARSING --------------------
     cashflows = parse_array(payload.get("cashflow", {}).get("cashflows"), "cashflows")
     ebitda = parse_array(payload.get("ebitda", {}).get("ebitda"), "ebitda")
-    dev_costs = parse_array(payload.get("development_costs", {}).get("costs"), "development_costs")
+    dev_costs = parse_array(
+        payload.get("development_costs", {}).get("costs"),
+        "development_costs",
+    )
 
     debt = payload.get("debt_terms", {})
 
-    loan = float(debt.get("loan_amount", 0))
-    rate = float(debt.get("interest_rate", 0))
-    tenor = int(debt.get("tenor_months", 0))
-    io_period = int(debt.get("interest_only_period", 0))
-    repayment = str(debt.get("repayment", "")).lower()
-    amort_rate = float(debt.get("amortisation_rate", 0))
-    availability = int(debt.get("availability_period", 0))
-    drawdown_mode = str(debt.get("drawdown_mode", "upfront")).lower()
-    roll_up = bool(debt.get("interest_roll_up", False))
+    loan = debt.get("loan_amount")
+    rate = debt.get("interest_rate")
+    tenor = debt.get("tenor_months")
+    io_period = debt.get("interest_only_period", 0)
+    repayment = debt.get("repayment")
+    amort_rate = debt.get("amortisation_rate", 0)
+    availability = debt.get("availability_period", 0)
+    drawdown_mode = debt.get("drawdown_mode", "upfront")
+    roll_up = debt.get("interest_roll_up", False)
 
-    arrangement_fee = float(debt.get("arrangement_fee", 0))
-    exit_fee = float(debt.get("exit_fee", 0))
+    arrangement_fee = debt.get("arrangement_fee", 0)
+    exit_fee = debt.get("exit_fee", 0)
 
     dscr_threshold = debt.get("dscr_threshold")
     icr_threshold = debt.get("icr_threshold")
@@ -55,6 +68,35 @@ def run_analysis(payload: dict, x_api_key: str = Header(None)):
     ltc_threshold = debt.get("ltc_threshold")
 
     property_value = debt.get("property_value")
+
+    # -------------------- DEBUG ECHO --------------------
+    if DEBUG:
+        return {
+            "debug_received": {
+                "cashflows": cashflows,
+                "ebitda": ebitda,
+                "development_costs": dev_costs,
+                "debt_terms": {
+                    "loan_amount": loan,
+                    "interest_rate": rate,
+                    "tenor_months": tenor,
+                    "interest_only_period": io_period,
+                    "repayment": repayment,
+                    "amortisation_rate": amort_rate,
+                    "availability_period": availability,
+                    "drawdown_mode": drawdown_mode,
+                    "interest_roll_up": roll_up,
+                    "arrangement_fee": arrangement_fee,
+                    "exit_fee": exit_fee,
+                    "dscr_threshold": dscr_threshold,
+                    "icr_threshold": icr_threshold,
+                    "debt_to_ebitda_max": debt_ebitda_max,
+                    "ltv_threshold": ltv_threshold,
+                    "ltc_threshold": ltc_threshold,
+                    "property_value": property_value,
+                },
+            }
+        }
 
     # -------------------- VALIDATION --------------------
     if not cashflows or len(cashflows) < tenor:
@@ -97,7 +139,6 @@ def run_analysis(payload: dict, x_api_key: str = Header(None)):
         undrawn -= draw
         balance += draw
         drawdowns.append(draw)
-
         balances.append(balance)
 
         # ---- INTEREST ----
@@ -115,12 +156,12 @@ def run_analysis(payload: dict, x_api_key: str = Header(None)):
                 princ = balance * amort_rate / 12
 
         if t == tenor:
-            princ = balance  # clean up
+            princ = balance
 
         principal.append(princ)
 
         # ---- BALANCE UPDATE ----
-        balance = balance - princ
+        balance -= princ
         if roll_up:
             balance += int_t
 
@@ -139,7 +180,7 @@ def run_analysis(payload: dict, x_api_key: str = Header(None)):
         if property_value:
             ltvs.append(balance / float(property_value))
 
-    # -------------------- METRICS (SAFE) --------------------
+    # -------------------- METRICS --------------------
     valid_dscrs = [x for x in dscrs if x is not None]
     min_dscr = min(valid_dscrs) if valid_dscrs else None
 
