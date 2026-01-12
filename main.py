@@ -1,16 +1,18 @@
 from fastapi import FastAPI, HTTPException, Header
+from fastapi.responses import PlainTextResponse
 import numpy as np
 import numpy_financial as npf
+import json
 
 app = FastAPI()
 
 API_KEY = "meadows_internal_key_123"
 
 
-# -------------------- DEBUG ENDPOINT --------------------
-@app.post("/debug")
+# -------------------- DEBUG ENDPOINT (PLAIN TEXT) --------------------
+@app.post("/debug", response_class=PlainTextResponse)
 def debug(payload: dict):
-    return payload
+    return json.dumps(payload)
 
 
 # -------------------- HELPERS --------------------
@@ -42,14 +44,11 @@ def parse_array(value, name):
 @app.post("/run-analysis")
 def run_analysis(payload: dict, x_api_key: str = Header(None)):
 
-    # ---- DEBUG LOG ----
     print("RAW PAYLOAD:", payload)
 
-    # ---- AUTH ----
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
-    # ---- INPUTS ----
     cashflows = parse_array(payload.get("cashflow", {}).get("cashflows"), "cashflows")
     ebitda = parse_array(payload.get("ebitda", {}).get("ebitda"), "ebitda")
     dev_costs = parse_array(payload.get("development_costs", {}).get("costs"), "development_costs")
@@ -65,7 +64,6 @@ def run_analysis(payload: dict, x_api_key: str = Header(None)):
     availability = int(debt.get("availability_period", 0))
     drawdown_mode = str(debt.get("drawdown_mode", "upfront")).lower()
 
-    # STRICT BOOLEAN
     roll_up = debt.get("interest_roll_up") is True
 
     arrangement_fee = float(debt.get("arrangement_fee", 0))
@@ -76,22 +74,10 @@ def run_analysis(payload: dict, x_api_key: str = Header(None)):
     debt_ebitda_max = debt.get("debt_to_ebitda_max")
     ltv_threshold = debt.get("ltv_threshold")
     ltc_threshold = debt.get("ltc_threshold")
-
     property_value = debt.get("property_value")
 
-    # ---- VALIDATION ----
     if len(cashflows) < tenor:
         raise HTTPException(status_code=400, detail="Insufficient cashflows")
-
-    if ebitda and len(ebitda) < tenor:
-        raise HTTPException(status_code=400, detail="Insufficient EBITDA values")
-
-    if dev_costs and len(dev_costs) < tenor:
-        raise HTTPException(status_code=400, detail="Insufficient development cost values")
-
-    # ---- ARRAYS ----
-    balance = 0.0
-    undrawn = loan
 
     balances = []
     interest = []
@@ -104,9 +90,10 @@ def run_analysis(payload: dict, x_api_key: str = Header(None)):
     ltcs = []
     ltvs = []
 
+    balance = 0.0
+    undrawn = loan
     monthly_rate = rate / 12
 
-    # ---- LOOP ----
     for t in range(1, tenor + 1):
 
         draw = 0.0
@@ -156,12 +143,7 @@ def run_analysis(payload: dict, x_api_key: str = Header(None)):
         if property_value:
             ltvs.append(balance / float(property_value))
 
-    # ---- METRICS ----
-    min_dscr = min(x for x in dscrs if x is not None) if any(dscrs) else None
-    min_icr = min(x for x in icrs if x is not None) if any(icrs) else None
-    max_debt_ebitda = max(x for x in debt_ebitdas if x is not None) if any(debt_ebitdas) else None
-    max_ltc = max(x for x in ltcs if x is not None) if any(ltcs) else None
-    max_ltv = max(x for x in ltvs if x is not None) if any(ltvs) else None
+    valid = lambda x: [i for i in x if i is not None]
 
     wal = (
         sum(p * (i + 1) for i, p in enumerate(principal)) / sum(principal)
@@ -187,13 +169,12 @@ def run_analysis(payload: dict, x_api_key: str = Header(None)):
     wacd = (total_interest + arrangement_fee + exit_fee) / (avg_balance * (tenor / 12))
     avg_interest = total_interest / tenor
 
-    # ---- OUTPUT ----
     return {
-        "min_dscr": min_dscr,
-        "min_icr": min_icr,
-        "max_debt_to_ebitda": max_debt_ebitda,
-        "max_ltc": max_ltc,
-        "max_ltv": max_ltv,
+        "min_dscr": min(valid(dscrs)) if valid(dscrs) else None,
+        "min_icr": min(valid(icrs)) if valid(icrs) else None,
+        "max_debt_to_ebitda": max(valid(debt_ebitdas)) if valid(debt_ebitdas) else None,
+        "max_ltc": max(valid(ltcs)) if valid(ltcs) else None,
+        "max_ltv": max(valid(ltvs)) if valid(ltvs) else None,
         "weighted_average_life_months": wal,
         "lender_irr": lender_irr,
         "weighted_avg_cost_of_debt": wacd,
