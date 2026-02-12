@@ -1,89 +1,117 @@
 from fastapi import FastAPI, HTTPException, Header
-from fastapi.responses import PlainTextResponse
 import numpy as np
 import numpy_financial as npf
-import json
 
 app = FastAPI()
-
 API_KEY = "meadows_internal_key_123"
 
 
-# -------------------- DEBUG ENDPOINT (PLAIN TEXT) --------------------
-@app.post("/debug", response_class=PlainTextResponse)
-def debug(payload: dict):
-    return json.dumps(payload)
+# -------------------- SAFE HELPERS --------------------
+
+def safe_float(value, default=0.0):
+    try:
+        if value in [None, ""]:
+            return default
+        return float(value)
+    except Exception:
+        return default
 
 
-# -------------------- HELPERS --------------------
-def parse_array(value, name):
+def safe_int(value, default=0):
+    try:
+        if value in [None, ""]:
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def parse_array_soft(value):
     if value is None:
-        raise HTTPException(status_code=400, detail=f"{name} is missing or null")
+        return []
 
     if isinstance(value, list):
-        try:
-            return [float(x) for x in value]
-        except Exception:
-            raise HTTPException(status_code=400, detail=f"{name} list contains non-numeric values")
+        return [safe_float(x, 0.0) for x in value]
 
     if isinstance(value, str):
-        try:
-            parts = [
-                p.replace(" ", "").replace("\u00A0", "")
-                for p in value.split(",")
-                if p.strip() != ""
-            ]
-            return [float(p) for p in parts]
-        except Exception:
-            raise HTTPException(status_code=400, detail=f"{name} contains non-numeric values")
+        parts = [
+            p.replace(" ", "").replace("\u00A0", "")
+            for p in value.split(",")
+            if p.strip() != ""
+        ]
+        return [safe_float(p, 0.0) for p in parts]
 
-    raise HTTPException(status_code=400, detail=f"{name} must be a list or comma-separated string")
+    return []
+
+
+def pad_array(arr, length):
+    if len(arr) >= length:
+        return arr[:length]
+    return arr + [0.0] * (length - len(arr))
+
+
+def safe_div(numerator, denominator):
+    try:
+        if denominator == 0:
+            return None
+        return numerator / denominator
+    except Exception:
+        return None
+
+
+def sanitize(value):
+    if value is None:
+        return None
+    if isinstance(value, float):
+        if np.isnan(value) or np.isinf(value):
+            return None
+    return value
 
 
 # -------------------- MAIN ENDPOINT --------------------
+
 @app.post("/run-analysis")
 def run_analysis(payload: dict, x_api_key: str = Header(None)):
-
-    print("RAW PAYLOAD:", payload)
 
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
-    cashflows = parse_array(payload.get("cashflow", {}).get("cashflows"), "cashflows")
-    ebitda = parse_array(payload.get("ebitda", {}).get("ebitda"), "ebitda")
-    dev_costs = parse_array(payload.get("development_costs", {}).get("costs"), "development_costs")
+    cashflows = parse_array_soft(payload.get("cashflow", {}).get("cashflows"))
+    ebitda = parse_array_soft(payload.get("ebitda", {}).get("ebitda"))
+    dev_costs = parse_array_soft(payload.get("development_costs", {}).get("costs"))
 
     debt = payload.get("debt_terms", {})
 
-    loan = float(debt.get("loan_amount", 0))
-    rate = float(debt.get("interest_rate", 0))
-    tenor = int(debt.get("tenor_months", 0))
-    io_period = int(debt.get("interest_only_period", 0))
+    loan = safe_float(debt.get("loan_amount"))
+    rate = safe_float(debt.get("interest_rate"))
+    tenor = safe_int(debt.get("tenor_months"))
+    io_period = safe_int(debt.get("interest_only_period"))
     repayment = str(debt.get("repayment", "")).lower()
-    amort_rate = float(debt.get("amortisation_rate", 0))
-    availability = int(debt.get("availability_period", 0))
+    amort_rate = safe_float(debt.get("amortisation_rate"))
+    availability = safe_int(debt.get("availability_period"))
     drawdown_mode = str(debt.get("drawdown_mode", "upfront")).lower()
-
     roll_up = debt.get("interest_roll_up") is True
+    arrangement_fee = safe_float(debt.get("arrangement_fee"))
+    exit_fee = safe_float(debt.get("exit_fee"))
+    property_value = safe_float(debt.get("property_value"))
 
-    arrangement_fee = float(debt.get("arrangement_fee", 0))
-    exit_fee = float(debt.get("exit_fee", 0))
+    # Use available data length if tenor missing
+    if tenor <= 0:
+        tenor = max(len(cashflows), 1)
 
-    dscr_threshold = debt.get("dscr_threshold")
-    icr_threshold = debt.get("icr_threshold")
-    debt_ebitda_max = debt.get("debt_to_ebitda_max")
-    ltv_threshold = debt.get("ltv_threshold")
-    ltc_threshold = debt.get("ltc_threshold")
-    property_value = debt.get("property_value")
+    # Prevent logical inconsistency
+    if io_period > tenor:
+        io_period = tenor
 
-    if len(cashflows) < tenor:
-        raise HTTPException(status_code=400, detail="Insufficient cashflows")
+    # Pad arrays safely
+    cashflows = pad_array(cashflows, tenor)
+    ebitda = pad_array(ebitda, tenor)
+    dev_costs = pad_array(dev_costs, tenor)
 
     balances = []
     interest = []
     principal = []
     drawdowns = []
-
     dscrs = []
     icrs = []
     debt_ebitdas = []
@@ -94,33 +122,30 @@ def run_analysis(payload: dict, x_api_key: str = Header(None)):
     undrawn = loan
     monthly_rate = rate / 12
 
-    for t in range(1, tenor + 1):
+    for t in range(tenor):
 
         draw = 0.0
-        if drawdown_mode == "upfront" and t == 1:
+        if drawdown_mode == "upfront" and t == 0:
             draw = loan
-        elif drawdown_mode == "liquidity" and t <= availability:
-            if cashflows[t - 1] < 0 and undrawn > 0:
-                draw = min(abs(cashflows[t - 1]), undrawn)
+        elif drawdown_mode == "liquidity" and t < availability:
+            if cashflows[t] < 0 and undrawn > 0:
+                draw = min(abs(cashflows[t]), undrawn)
 
         undrawn -= draw
         balance += draw
         drawdowns.append(draw)
-        balances.append(balance)
 
         int_t = balance * monthly_rate
         interest.append(int_t)
 
         princ = 0.0
-        if t > io_period:
-            if repayment == "bullet":
-                princ = 0.0
-            elif repayment == "amortising_straight_line":
+        if t >= io_period:
+            if repayment == "amortising_straight_line" and tenor > io_period:
                 princ = loan / (tenor - io_period)
             elif repayment == "amortising_reducing_balance":
                 princ = balance * amort_rate / 12
 
-        if t == tenor:
+        if t == tenor - 1:
             princ = balance
 
         principal.append(princ)
@@ -129,27 +154,26 @@ def run_analysis(payload: dict, x_api_key: str = Header(None)):
         if roll_up:
             balance += int_t
 
+        balances.append(balance)
+
         debt_service = int_t + princ
-        dscrs.append(cashflows[t - 1] / debt_service if debt_service > 0 else None)
 
-        if ebitda:
-            icrs.append(ebitda[t - 1] / int_t if int_t > 0 else None)
-            debt_ebitdas.append(balance / ebitda[t - 1] if ebitda[t - 1] > 0 else None)
+        dscrs.append(safe_div(cashflows[t], debt_service))
+        icrs.append(safe_div(ebitda[t], int_t))
+        debt_ebitdas.append(safe_div(balance, ebitda[t]))
+        cum_cost = sum(dev_costs[: t + 1])
+        ltcs.append(safe_div(balance, cum_cost))
+        ltvs.append(safe_div(balance, property_value))
 
-        if dev_costs:
-            cum_cost = sum(dev_costs[:t])
-            ltcs.append(balance / cum_cost if cum_cost > 0 else None)
-
-        if property_value:
-            ltvs.append(balance / float(property_value))
-
-    valid = lambda x: [i for i in x if i is not None]
-
+    # WAL
+    total_principal = sum(principal)
     wal = (
-        sum(p * (i + 1) for i, p in enumerate(principal)) / sum(principal)
-        if sum(principal) > 0 else tenor
+        sum(p * (i + 1) for i, p in enumerate(principal)) / total_principal
+        if total_principal > 0
+        else tenor
     )
 
+    # Lender cashflows
     lender_cfs = []
     for i in range(tenor):
         cf = -drawdowns[i]
@@ -158,26 +182,34 @@ def run_analysis(payload: dict, x_api_key: str = Header(None)):
         cf += principal[i]
         lender_cfs.append(cf)
 
-    lender_cfs[0] -= arrangement_fee
-    lender_cfs[-1] += exit_fee
+    if lender_cfs:
+        lender_cfs[0] -= arrangement_fee
+        lender_cfs[-1] += exit_fee
 
-    lender_irr = npf.irr(lender_cfs)
+    try:
+        lender_irr = npf.irr(lender_cfs)
+    except Exception:
+        lender_irr = None
 
     total_interest = sum(interest)
-    avg_balance = np.mean(balances)
+    avg_balance = np.mean(balances) if balances else 0.0
 
-    wacd = (total_interest + arrangement_fee + exit_fee) / (avg_balance * (tenor / 12))
-    avg_interest = total_interest / tenor
+    wacd = safe_div(
+        total_interest + arrangement_fee + exit_fee,
+        avg_balance * (tenor / 12) if tenor > 0 else 0,
+    )
+
+    avg_interest = safe_div(total_interest, tenor)
 
     return {
-        "min_dscr": min(valid(dscrs)) if valid(dscrs) else None,
-        "min_icr": min(valid(icrs)) if valid(icrs) else None,
-        "max_debt_to_ebitda": max(valid(debt_ebitdas)) if valid(debt_ebitdas) else None,
-        "max_ltc": max(valid(ltcs)) if valid(ltcs) else None,
-        "max_ltv": max(valid(ltvs)) if valid(ltvs) else None,
-        "weighted_average_life_months": wal,
-        "lender_irr": lender_irr,
-        "weighted_avg_cost_of_debt": wacd,
-        "average_interest": avg_interest,
-        "ending_balance": balance,
+        "min_dscr": sanitize(min([x for x in dscrs if x is not None], default=None)),
+        "min_icr": sanitize(min([x for x in icrs if x is not None], default=None)),
+        "max_debt_to_ebitda": sanitize(max([x for x in debt_ebitdas if x is not None], default=None)),
+        "max_ltc": sanitize(max([x for x in ltcs if x is not None], default=None)),
+        "max_ltv": sanitize(max([x for x in ltvs if x is not None], default=None)),
+        "weighted_average_life_months": sanitize(wal),
+        "lender_irr": sanitize(lender_irr),
+        "weighted_avg_cost_of_debt": sanitize(wacd),
+        "average_interest": sanitize(avg_interest),
+        "ending_balance": sanitize(balance),
     }
