@@ -94,6 +94,16 @@ def run_analysis(payload: dict, x_api_key: str = Header(None)):
     exit_fee = safe_float(debt.get("exit_fee"))
     property_value = safe_float(debt.get("property_value"))
 
+    # Defensive: if rates passed as 1 instead of 0.01
+    if arrangement_fee > 1:
+        arrangement_fee = arrangement_fee / 100
+
+    if exit_fee > 1:
+        exit_fee = exit_fee / 100
+
+    if rate > 1:
+        rate = rate / 100
+
     if tenor <= 0:
         tenor = max(len(cashflows), 1)
 
@@ -173,6 +183,10 @@ def run_analysis(payload: dict, x_api_key: str = Header(None)):
         else tenor
     )
 
+    # Convert percentage fees to cash amounts
+    arrangement_fee_cash = loan * arrangement_fee
+    exit_fee_cash = loan * exit_fee
+
     lender_cfs = []
 
     for i in range(tenor):
@@ -183,11 +197,12 @@ def run_analysis(payload: dict, x_api_key: str = Header(None)):
         lender_cfs.append(cf)
 
     if lender_cfs:
-        lender_cfs[0] -= arrangement_fee
-        lender_cfs[-1] += exit_fee
+        lender_cfs[0] -= arrangement_fee_cash
+        lender_cfs[-1] += exit_fee_cash
 
     try:
-        lender_irr = npf.irr(lender_cfs)
+        monthly_irr = npf.irr(lender_cfs)
+        lender_irr = (1 + monthly_irr) ** 12 - 1 if monthly_irr is not None else None
     except Exception:
         lender_irr = None
 
@@ -195,7 +210,7 @@ def run_analysis(payload: dict, x_api_key: str = Header(None)):
     avg_balance = np.mean(balances) if balances else 0.0
 
     wacd = safe_div(
-        total_interest + arrangement_fee + exit_fee,
+        total_interest + arrangement_fee_cash + exit_fee_cash,
         avg_balance * (tenor / 12) if tenor > 0 else 0,
     )
 
@@ -219,6 +234,8 @@ def run_analysis(payload: dict, x_api_key: str = Header(None)):
             "rate": rate,
             "monthly_rate": monthly_rate,
             "loan": loan,
+            "arrangement_fee_cash": arrangement_fee_cash,
+            "exit_fee_cash": exit_fee_cash,
             "drawdowns": drawdowns,
             "balances": balances,
             "interest": interest,
@@ -227,4 +244,3 @@ def run_analysis(payload: dict, x_api_key: str = Header(None)):
         }
 
     return response
-
