@@ -6,7 +6,7 @@ app = FastAPI()
 API_KEY = "meadows_internal_key_123"
 
 
-# -------------------- SAFE HELPERS --------------------
+# ---------------- SAFE HELPERS ----------------
 
 def safe_float(value, default=0.0):
     try:
@@ -29,10 +29,8 @@ def safe_int(value, default=0):
 def parse_array_soft(value):
     if value is None:
         return []
-
     if isinstance(value, list):
         return [safe_float(x, 0.0) for x in value]
-
     if isinstance(value, str):
         parts = [
             p.replace(" ", "").replace("\u00A0", "")
@@ -40,7 +38,6 @@ def parse_array_soft(value):
             if p.strip() != ""
         ]
         return [safe_float(p, 0.0) for p in parts]
-
     return []
 
 
@@ -68,13 +65,15 @@ def sanitize(value):
     return value
 
 
-# -------------------- MAIN ENDPOINT --------------------
+# ---------------- MAIN ENDPOINT ----------------
 
 @app.post("/run-analysis")
 def run_analysis(payload: dict, x_api_key: str = Header(None)):
 
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+    debug_mode = payload.get("debug", False)
 
     cashflows = parse_array_soft(payload.get("cashflow", {}).get("cashflows"))
     ebitda = parse_array_soft(payload.get("ebitda", {}).get("ebitda"))
@@ -95,15 +94,12 @@ def run_analysis(payload: dict, x_api_key: str = Header(None)):
     exit_fee = safe_float(debt.get("exit_fee"))
     property_value = safe_float(debt.get("property_value"))
 
-    # Use available data length if tenor missing
     if tenor <= 0:
         tenor = max(len(cashflows), 1)
 
-    # Prevent logical inconsistency
     if io_period > tenor:
         io_period = tenor
 
-    # Pad arrays safely
     cashflows = pad_array(cashflows, tenor)
     ebitda = pad_array(ebitda, tenor)
     dev_costs = pad_array(dev_costs, tenor)
@@ -112,6 +108,7 @@ def run_analysis(payload: dict, x_api_key: str = Header(None)):
     interest = []
     principal = []
     drawdowns = []
+
     dscrs = []
     icrs = []
     debt_ebitdas = []
@@ -125,8 +122,10 @@ def run_analysis(payload: dict, x_api_key: str = Header(None)):
     for t in range(tenor):
 
         draw = 0.0
+
         if drawdown_mode == "upfront" and t == 0:
             draw = loan
+
         elif drawdown_mode == "liquidity" and t < availability:
             if cashflows[t] < 0 and undrawn > 0:
                 draw = min(abs(cashflows[t]), undrawn)
@@ -139,6 +138,7 @@ def run_analysis(payload: dict, x_api_key: str = Header(None)):
         interest.append(int_t)
 
         princ = 0.0
+
         if t >= io_period:
             if repayment == "amortising_straight_line" and tenor > io_period:
                 princ = loan / (tenor - io_period)
@@ -165,16 +165,16 @@ def run_analysis(payload: dict, x_api_key: str = Header(None)):
         ltcs.append(safe_div(balance, cum_cost))
         ltvs.append(safe_div(balance, property_value))
 
-    # WAL
     total_principal = sum(principal)
+
     wal = (
         sum(p * (i + 1) for i, p in enumerate(principal)) / total_principal
         if total_principal > 0
         else tenor
     )
 
-    # Lender cashflows
     lender_cfs = []
+
     for i in range(tenor):
         cf = -drawdowns[i]
         if not roll_up:
@@ -201,7 +201,7 @@ def run_analysis(payload: dict, x_api_key: str = Header(None)):
 
     avg_interest = safe_div(total_interest, tenor)
 
-    return {
+    response = {
         "min_dscr": sanitize(min([x for x in dscrs if x is not None], default=None)),
         "min_icr": sanitize(min([x for x in icrs if x is not None], default=None)),
         "max_debt_to_ebitda": sanitize(max([x for x in debt_ebitdas if x is not None], default=None)),
@@ -213,3 +213,17 @@ def run_analysis(payload: dict, x_api_key: str = Header(None)):
         "average_interest": sanitize(avg_interest),
         "ending_balance": sanitize(balance),
     }
+
+    if debug_mode:
+        response["debug"] = {
+            "rate": rate,
+            "monthly_rate": monthly_rate,
+            "loan": loan,
+            "drawdowns": drawdowns,
+            "balances": balances,
+            "interest": interest,
+            "principal": principal,
+            "lender_cashflows": lender_cfs,
+        }
+
+    return response
