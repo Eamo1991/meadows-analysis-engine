@@ -73,7 +73,7 @@ def run_analysis(payload: dict, x_api_key: str = Header(None)):
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
-    debug_mode = payload.get("debug", False)
+    debug_mode = payload.get("debug", True)
 
     cashflows = parse_array_soft(payload.get("cashflow", {}).get("cashflows"))
     ebitda = parse_array_soft(payload.get("ebitda", {}).get("ebitda"))
@@ -227,3 +227,4 @@ def run_analysis(payload: dict, x_api_key: str = Header(None)):
         }
 
     return response
+
