@@ -82,7 +82,25 @@ def run_analysis(payload: dict, x_api_key: str = Header(None)):
     debt = payload.get("debt_terms", {})
 
     loan = safe_float(debt.get("loan_amount"))
-    rate = safe_float(debt.get("interest_rate"))
+
+    # -------- RATE STRUCTURE UPDATE --------
+    margin = safe_float(debt.get("interest_margin"))
+    reference_rate = safe_float(debt.get("reference_rate"))
+    fallback_rate = safe_float(debt.get("interest_rate"))
+
+    # Defensive % handling
+    if margin > 1:
+        margin /= 100
+    if reference_rate > 1:
+        reference_rate /= 100
+    if fallback_rate > 1:
+        fallback_rate /= 100
+
+    # Use margin + reference if provided, otherwise fallback
+    rate = margin + reference_rate if (margin + reference_rate) > 0 else fallback_rate
+
+    # ---------------------------------------
+
     tenor = safe_int(debt.get("tenor_months"))
     io_period = safe_int(debt.get("interest_only_period"))
     repayment = str(debt.get("repayment", "")).lower()
@@ -90,19 +108,15 @@ def run_analysis(payload: dict, x_api_key: str = Header(None)):
     availability = safe_int(debt.get("availability_period"))
     drawdown_mode = str(debt.get("drawdown_mode", "upfront")).lower()
     roll_up = debt.get("interest_roll_up") is True
+
     arrangement_fee = safe_float(debt.get("arrangement_fee"))
     exit_fee = safe_float(debt.get("exit_fee"))
     property_value = safe_float(debt.get("property_value"))
 
-    # Defensive: if rates passed as 1 instead of 0.01
     if arrangement_fee > 1:
-        arrangement_fee = arrangement_fee / 100
-
+        arrangement_fee /= 100
     if exit_fee > 1:
-        exit_fee = exit_fee / 100
-
-    if rate > 1:
-        rate = rate / 100
+        exit_fee /= 100
 
     if tenor <= 0:
         tenor = max(len(cashflows), 1)
@@ -128,6 +142,8 @@ def run_analysis(payload: dict, x_api_key: str = Header(None)):
     balance = 0.0
     undrawn = loan
     monthly_rate = rate / 12
+
+    refinance_balance = 0.0
 
     for t in range(tenor):
 
@@ -155,8 +171,10 @@ def run_analysis(payload: dict, x_api_key: str = Header(None)):
             elif repayment == "amortising_reducing_balance":
                 princ = balance * amort_rate / 12
 
+        # Capture refinance balance BEFORE final forced repayment
         if t == tenor - 1:
-            princ = balance
+            refinance_balance = balance
+            princ = balance  # full repayment for IRR maths
 
         principal.append(princ)
         balance -= princ
@@ -183,7 +201,6 @@ def run_analysis(payload: dict, x_api_key: str = Header(None)):
         else tenor
     )
 
-    # Convert percentage fees to cash amounts
     arrangement_fee_cash = loan * arrangement_fee
     exit_fee_cash = loan * exit_fee
 
@@ -226,20 +243,16 @@ def run_analysis(payload: dict, x_api_key: str = Header(None)):
         "lender_irr": sanitize(lender_irr),
         "weighted_avg_cost_of_debt": sanitize(wacd),
         "average_interest": sanitize(avg_interest),
-        "ending_balance": sanitize(balance),
+        "ending_balance": sanitize(refinance_balance),  # now refinance amount
     }
 
     if debug_mode:
         response["debug"] = {
             "rate": rate,
+            "margin": margin,
+            "reference_rate": reference_rate,
             "monthly_rate": monthly_rate,
-            "loan": loan,
-            "arrangement_fee_cash": arrangement_fee_cash,
-            "exit_fee_cash": exit_fee_cash,
-            "drawdowns": drawdowns,
-            "balances": balances,
-            "interest": interest,
-            "principal": principal,
+            "refinance_balance": refinance_balance,
             "lender_cashflows": lender_cfs,
         }
 
